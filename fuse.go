@@ -3,9 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
-	"flag"
 	"fmt"
-	"log"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -27,7 +25,8 @@ type FileInfo struct {
 }
 
 type FS struct {
-	client *http.Client
+	client  *http.Client
+	baseURL string
 }
 
 func (fs *FS) Root() (fs.Node, error) {
@@ -50,8 +49,8 @@ func (d *Dir) Attr(ctx context.Context, attr *fuse.Attr) error {
 
 func (d *Dir) Lookup(ctx context.Context, name string) (fs.Node, error) {
 	path := filepath.Join(d.path, name)
-	
-	resp, err := d.fs.client.Get(fmt.Sprintf("http://localhost:8080/info?path=%s", path))
+
+	resp, err := d.fs.client.Get(fmt.Sprintf("%s/info?path=%s", d.fs.baseURL, path))
 	if err != nil {
 		return nil, syscall.ENOENT
 	}
@@ -73,7 +72,7 @@ func (d *Dir) Lookup(ctx context.Context, name string) (fs.Node, error) {
 }
 
 func (d *Dir) ReadDirAll(ctx context.Context) ([]fuse.Dirent, error) {
-	resp, err := d.fs.client.Get(fmt.Sprintf("http://localhost:8080/list?path=%s", d.path))
+	resp, err := d.fs.client.Get(fmt.Sprintf("%s/list?path=%s", d.fs.baseURL, d.path))
 	if err != nil {
 		return nil, err
 	}
@@ -114,7 +113,7 @@ func (f *File) Attr(ctx context.Context, attr *fuse.Attr) error {
 }
 
 func (f *File) ReadAll(ctx context.Context) ([]byte, error) {
-	resp, err := f.fs.client.Get(fmt.Sprintf("http://localhost:8080/read?path=%s", f.path))
+	resp, err := f.fs.client.Get(fmt.Sprintf("%s/read?path=%s", f.fs.baseURL, f.path))
 	if err != nil {
 		return nil, err
 	}
@@ -126,38 +125,4 @@ func (f *File) ReadAll(ctx context.Context) ([]byte, error) {
 	}
 
 	return fileData.Content, nil
-}
-
-func main() {
-	flag.Usage = func() {
-		fmt.Fprintf(os.Stderr, "Usage: %s MOUNTPOINT\n", os.Args[0])
-		flag.PrintDefaults()
-	}
-
-	flag.Parse()
-	if flag.NArg() != 1 {
-		flag.Usage()
-		os.Exit(2)
-	}
-
-	mountpoint := flag.Arg(0)
-	c, err := fuse.Mount(
-		mountpoint,
-		fuse.FSName("remotefs"),
-		fuse.Subtype("remotefs"),
-		fuse.AllowOther(),
-	)
-	if err != nil {
-		log.Fatal(err)
-	}
-	defer c.Close()
-
-	filesys := &FS{
-		client: &http.Client{
-			Timeout: 10 * time.Second,
-		},
-	}
-	if err := fs.Serve(c, filesys); err != nil {
-		log.Fatal(err)
-	}
 }

@@ -1,0 +1,28 @@
+mount: /mnt/synced
+server_addr: :8080
+
+filesystems:
+  # First filesystem acts as a cache
+  - type: local
+    role: cache
+    path: /tmp/fs-cache
+    max_size: 1073741824  # 1GB in bytes
+    can_update: true
+    can_delete: true
+
+  # Second filesystem is the main storage
+  - type: local
+    role: main
+    path: /home/user/data
+    can_update: true
+    can_delete: true
+
+  # Example of how to add an S3 backend (not implemented yet)
+  # - type: s3
+  #   role: main
+  #   path: my-bucket/path
+  #   can_update: true
+  #   can_delete: true
+  #   aws_region: us-east-1
+  #   aws_access_key: your-access-key
+  #   aws_secret_key: your-secret-key

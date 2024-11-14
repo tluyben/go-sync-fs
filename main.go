@@ -3,31 +3,25 @@ package main
 import (
 	"encoding/json"
 	"flag"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
-	"path/filepath"
 	"time"
+
+	"bazil.org/fuse"
+	"bazil.org/fuse/fs"
 )
 
-type FileInfo struct {
-	Name    string
-	Size    int64
-	Mode    os.FileMode
-	ModTime time.Time
-	IsDir   bool
-	Content []byte // Only for files
-}
-
+// Server components
 type FileServer struct {
-	root string
+	fs ServerFS
 }
 
 func (s *FileServer) handleInfo(w http.ResponseWriter, r *http.Request) {
 	path := r.URL.Query().Get("path")
-	fullPath := filepath.Join(s.root, path)
 
-	info, err := os.Stat(fullPath)
+	info, err := s.fs.Info(path)
 	if os.IsNotExist(err) {
 		http.Error(w, "Not found", http.StatusNotFound)
 		return
@@ -37,43 +31,16 @@ func (s *FileServer) handleInfo(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	fileInfo := FileInfo{
-		Name:    info.Name(),
-		Size:    info.Size(),
-		Mode:    info.Mode(),
-		ModTime: info.ModTime(),
-		IsDir:   info.IsDir(),
-	}
-
-	json.NewEncoder(w).Encode(fileInfo)
+	json.NewEncoder(w).Encode(info)
 }
 
 func (s *FileServer) handleList(w http.ResponseWriter, r *http.Request) {
 	path := r.URL.Query().Get("path")
-	fullPath := filepath.Join(s.root, path)
 
-	dir, err := os.Open(fullPath)
+	files, err := s.fs.List(path)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
-	}
-	defer dir.Close()
-
-	entries, err := dir.Readdir(-1)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	var files []FileInfo
-	for _, entry := range entries {
-		files = append(files, FileInfo{
-			Name:    entry.Name(),
-			Size:    entry.Size(),
-			Mode:    entry.Mode(),
-			ModTime: entry.ModTime(),
-			IsDir:   entry.IsDir(),
-		})
 	}
 
 	json.NewEncoder(w).Encode(files)
@@ -81,9 +48,8 @@ func (s *FileServer) handleList(w http.ResponseWriter, r *http.Request) {
 
 func (s *FileServer) handleRead(w http.ResponseWriter, r *http.Request) {
 	path := r.URL.Query().Get("path")
-	fullPath := filepath.Join(s.root, path)
 
-	info, err := os.Stat(fullPath)
+	info, err := s.fs.Info(path)
 	if os.IsNotExist(err) {
 		http.Error(w, "Not found", http.StatusNotFound)
 		return
@@ -93,22 +59,14 @@ func (s *FileServer) handleRead(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	content, err := os.ReadFile(fullPath)
+	content, err := s.fs.Read(path)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 
-	fileInfo := FileInfo{
-		Name:    info.Name(),
-		Size:    info.Size(),
-		Mode:    info.Mode(),
-		ModTime: info.ModTime(),
-		IsDir:   info.IsDir(),
-		Content: content,
-	}
-
-	json.NewEncoder(w).Encode(fileInfo)
+	info.Content = content
+	json.NewEncoder(w).Encode(info)
 }
 
 func (s *FileServer) handleWrite(w http.ResponseWriter, r *http.Request) {
@@ -124,15 +82,8 @@ func (s *FileServer) handleWrite(w http.ResponseWriter, r *http.Request) {
 	}
 
 	path := r.URL.Query().Get("path")
-	fullPath := filepath.Join(s.root, path)
 
-	// Ensure parent directory exists
-	if err := os.MkdirAll(filepath.Dir(fullPath), 0o755); err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	if err := os.WriteFile(fullPath, fileInfo.Content, fileInfo.Mode); err != nil {
+	if err := s.fs.Write(path, fileInfo.Content, fileInfo.Mode); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -140,29 +91,123 @@ func (s *FileServer) handleWrite(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 }
 
-func main() {
-	var root string
-	flag.StringVar(&root, "root", "", "Root directory to serve")
-	var addr string
-	flag.StringVar(&addr, "addr", ":8080", "Address to listen on")
-	flag.Parse()
-
-	if root == "" {
-		log.Fatal("Must specify -root")
-	}
-
-	absRoot, err := filepath.Abs(root)
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	server := &FileServer{root: absRoot}
+func startFileServer(fs ServerFS, serverAddr string) error {
+	server := &FileServer{fs: fs}
 
 	http.HandleFunc("/info", server.handleInfo)
 	http.HandleFunc("/list", server.handleList)
 	http.HandleFunc("/read", server.handleRead)
 	http.HandleFunc("/write", server.handleWrite)
 
-	log.Printf("Serving %s on %s", absRoot, addr)
-	log.Fatal(http.ListenAndServe(addr, nil))
+	log.Printf("Starting server on %s", serverAddr)
+	return http.ListenAndServe(serverAddr, nil)
+}
+
+func startFUSE(mountpoint string, serverURL string) error {
+	c, err := fuse.Mount(
+		mountpoint,
+		fuse.FSName("remotefs"),
+		fuse.Subtype("remotefs"),
+		fuse.AllowOther(),
+	)
+	if err != nil {
+		return err
+	}
+	defer c.Close()
+
+	filesys := &FS{
+		client: &http.Client{
+			Timeout: 10 * time.Second,
+		},
+		baseURL: serverURL,
+	}
+
+	log.Printf("Mounting FUSE at %s, connecting to %s", mountpoint, serverURL)
+	return fs.Serve(c, filesys)
+}
+
+func main() {
+	var configPath string
+	var masterDir string
+	var serverAddr string
+	var mountpoint string
+	var role string
+	var maxCacheSize int64
+
+	// Support both config file and command line arguments
+	flag.StringVar(&configPath, "config", "", "Path to YAML config file")
+	flag.StringVar(&masterDir, "master", "", "Master directory to serve files from (legacy)")
+	flag.StringVar(&serverAddr, "server", ":8080", "Server address (host:port) (legacy)")
+	flag.StringVar(&mountpoint, "mount", "", "Directory to mount FUSE filesystem (legacy)")
+	flag.StringVar(&role, "role", "main", "Filesystem role (main or cache) (legacy)")
+	flag.Int64Var(&maxCacheSize, "cache-size", 1024*1024*1024, "Max cache size in bytes (default 1GB) (legacy)")
+	flag.Parse()
+
+	var fs ServerFS
+	var err error
+
+	if configPath != "" {
+		// Use YAML config
+		config, err := LoadConfig(configPath)
+		if err != nil {
+			log.Fatalf("Error loading config: %v", err)
+		}
+
+		filesystems, err := createFileSystems(config)
+		if err != nil {
+			log.Fatalf("Error creating filesystems: %v", err)
+		}
+
+		fs = NewChainFS(filesystems)
+		serverAddr = config.ServerAddr
+		mountpoint = config.Mount
+	} else {
+		// Legacy command line arguments
+		if masterDir == "" {
+			log.Fatal("Must specify -master or provide a config file with -config")
+		}
+		if mountpoint == "" {
+			log.Fatal("Must specify -mount or provide a config file with -config")
+		}
+
+		fsRole := FileSystemRole(role)
+		if fsRole != RoleMain && fsRole != RoleCache {
+			log.Fatal("Role must be either 'main' or 'cache'")
+		}
+
+		fs, err = NewLocalFS(FileSystemConfig{
+			Role:    fsRole,
+			MaxSize: maxCacheSize,
+			Features: FileSystemFeatures{
+				CanUpdate: true,
+				CanDelete: true,
+				CanLock:   false,
+			},
+			RootPath: masterDir,
+		})
+		if err != nil {
+			log.Fatal(err)
+		}
+	}
+
+	// Start the file server in a goroutine
+	go func() {
+		if err := startFileServer(fs, serverAddr); err != nil {
+			log.Fatal(err)
+		}
+	}()
+
+	// Give the server a moment to start
+	time.Sleep(100 * time.Millisecond)
+
+	// Construct server URL for FUSE
+	serverURL := fmt.Sprintf("http://localhost%s", serverAddr)
+	if serverAddr[0] != ':' {
+		serverURL = fmt.Sprintf("http://%s", serverAddr)
+	}
+
+	// Start FUSE
+	if err := startFUSE(mountpoint, serverURL); err != nil {
+		log.Fatal(err)
+	}
 }
