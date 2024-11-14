@@ -24,6 +24,23 @@ const (
 	RoleCache FileSystemRole = "cache"
 )
 
+// LockType represents the type of lock
+type LockType int
+
+const (
+	ReadLock LockType = iota
+	WriteLock
+	ExclusiveLock
+)
+
+// FileLock represents a lock on a file
+type FileLock struct {
+	Path      string
+	LockType  LockType
+	CreatedAt time.Time
+	ProcessID int
+}
+
 // FileSystemConfig holds the configuration for a filesystem
 type FileSystemConfig struct {
 	Role     FileSystemRole
@@ -40,6 +57,11 @@ type ServerFS interface {
 	Read(path string) ([]byte, error)
 	Write(path string, content []byte, mode os.FileMode) error
 	Delete(path string) error
+
+	// Lock operations
+	Lock(path string, lockType LockType, processID int) error
+	Unlock(path string, processID int) error
+	IsLocked(path string) (bool, LockType, error)
 
 	// Metadata
 	GetFeatures() FileSystemFeatures
@@ -60,6 +82,8 @@ type LocalFS struct {
 	root      string
 	mutex     sync.RWMutex
 	cacheList []CacheEntry // Only used when role is RoleCache
+	locks     map[string]FileLock
+	lockMutex sync.RWMutex
 }
 
 // NewLocalFS creates a new LocalFS instance
@@ -82,7 +106,81 @@ func NewLocalFS(config FileSystemConfig) (*LocalFS, error) {
 		config:    config,
 		root:      absRoot,
 		cacheList: make([]CacheEntry, 0),
+		locks:     make(map[string]FileLock),
 	}, nil
+}
+
+// Lock implements file locking
+func (l *LocalFS) Lock(path string, lockType LockType, processID int) error {
+	if !l.config.Features.CanLock {
+		return errors.New("filesystem does not support locking")
+	}
+
+	l.lockMutex.Lock()
+	defer l.lockMutex.Unlock()
+
+	// Check if file exists
+	fullPath := filepath.Join(l.root, path)
+	if _, err := os.Stat(fullPath); err != nil {
+		return err
+	}
+
+	// Check existing lock
+	if existingLock, exists := l.locks[path]; exists {
+		// Allow multiple read locks
+		if existingLock.LockType == ReadLock && lockType == ReadLock {
+			return nil
+		}
+		return errors.New("file is already locked")
+	}
+
+	// Create new lock
+	l.locks[path] = FileLock{
+		Path:      path,
+		LockType:  lockType,
+		CreatedAt: time.Now(),
+		ProcessID: processID,
+	}
+
+	return nil
+}
+
+// Unlock removes a lock on a file
+func (l *LocalFS) Unlock(path string, processID int) error {
+	if !l.config.Features.CanLock {
+		return errors.New("filesystem does not support locking")
+	}
+
+	l.lockMutex.Lock()
+	defer l.lockMutex.Unlock()
+
+	lock, exists := l.locks[path]
+	if !exists {
+		return errors.New("file is not locked")
+	}
+
+	if lock.ProcessID != processID {
+		return errors.New("lock belongs to different process")
+	}
+
+	delete(l.locks, path)
+	return nil
+}
+
+// IsLocked checks if a file is locked
+func (l *LocalFS) IsLocked(path string) (bool, LockType, error) {
+	if !l.config.Features.CanLock {
+		return false, 0, errors.New("filesystem does not support locking")
+	}
+
+	l.lockMutex.RLock()
+	defer l.lockMutex.RUnlock()
+
+	if lock, exists := l.locks[path]; exists {
+		return true, lock.LockType, nil
+	}
+
+	return false, 0, nil
 }
 
 func (l *LocalFS) Info(path string) (FileInfo, error) {
@@ -129,6 +227,14 @@ func (l *LocalFS) List(path string) ([]FileInfo, error) {
 }
 
 func (l *LocalFS) Read(path string) ([]byte, error) {
+	// Check read lock
+	if l.config.Features.CanLock {
+		locked, lockType, _ := l.IsLocked(path)
+		if locked && (lockType == WriteLock || lockType == ExclusiveLock) {
+			return nil, errors.New("file is locked for writing")
+		}
+	}
+
 	fullPath := filepath.Join(l.root, path)
 	content, err := os.ReadFile(fullPath)
 	if err != nil {
@@ -145,6 +251,14 @@ func (l *LocalFS) Read(path string) ([]byte, error) {
 func (l *LocalFS) Write(path string, content []byte, mode os.FileMode) error {
 	if !l.config.Features.CanUpdate {
 		return errors.New("filesystem does not support updates")
+	}
+
+	// Check write lock
+	if l.config.Features.CanLock {
+		locked, lockType, _ := l.IsLocked(path)
+		if locked && (lockType == ReadLock || lockType == WriteLock || lockType == ExclusiveLock) {
+			return errors.New("file is locked")
+		}
 	}
 
 	fullPath := filepath.Join(l.root, path)
@@ -175,6 +289,14 @@ func (l *LocalFS) Write(path string, content []byte, mode os.FileMode) error {
 func (l *LocalFS) Delete(path string) error {
 	if !l.config.Features.CanDelete {
 		return errors.New("filesystem does not support deletion")
+	}
+
+	// Check exclusive lock
+	if l.config.Features.CanLock {
+		locked, _, _ := l.IsLocked(path)
+		if locked {
+			return errors.New("file is locked")
+		}
 	}
 
 	fullPath := filepath.Join(l.root, path)

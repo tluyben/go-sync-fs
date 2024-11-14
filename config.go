@@ -14,12 +14,14 @@ type FSConfig struct {
 	MaxSize   int64  `yaml:"max_size"`   // For cache filesystems
 	CanUpdate bool   `yaml:"can_update"` // Whether writes are allowed
 	CanDelete bool   `yaml:"can_delete"` // Whether deletes are allowed
+	CanLock   bool   `yaml:"can_lock"`   // Whether file locking is supported
 }
 
 type Config struct {
 	Mount       string     `yaml:"mount"`       // FUSE mount point
 	ServerAddr  string     `yaml:"server_addr"` // Server address (host:port)
 	FileSystems []FSConfig `yaml:"filesystems"` // List of filesystems in order
+	HasLocking  bool       `yaml:"-"`           // Computed field indicating if chain supports locking
 }
 
 func LoadConfig(path string) (*Config, error) {
@@ -44,6 +46,17 @@ func LoadConfig(path string) (*Config, error) {
 		config.ServerAddr = ":8080" // Default server address
 	}
 
+	// Validate that the first filesystem supports locking if any filesystem does
+	for i, fs := range config.FileSystems {
+		if fs.CanLock {
+			config.HasLocking = true
+			if i > 0 {
+				return nil, fmt.Errorf("only the first filesystem in the chain can support locking")
+			}
+			break
+		}
+	}
+
 	return &config, nil
 }
 
@@ -54,7 +67,7 @@ func createFileSystems(config *Config) ([]ServerFS, error) {
 		features := FileSystemFeatures{
 			CanUpdate: fsConfig.CanUpdate,
 			CanDelete: fsConfig.CanDelete,
-			CanLock:   false, // Not implemented yet
+			CanLock:   fsConfig.CanLock,
 		}
 
 		fsRole := FileSystemRole(fsConfig.Role)

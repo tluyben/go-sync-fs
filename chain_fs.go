@@ -19,6 +19,55 @@ func NewChainFS(filesystems []ServerFS) *ChainFS {
 	}
 }
 
+// findFirstLockableFS returns the first filesystem that supports locking
+func (c *ChainFS) findFirstLockableFS() (ServerFS, error) {
+	for _, fs := range c.filesystems {
+		if fs.GetFeatures().CanLock {
+			return fs, nil
+		}
+	}
+	return nil, fmt.Errorf("no filesystem in the chain supports locking")
+}
+
+// Lock implements file locking using the first filesystem that supports it
+func (c *ChainFS) Lock(path string, lockType LockType, processID int) error {
+	c.mutex.RLock()
+	defer c.mutex.RUnlock()
+
+	fs, err := c.findFirstLockableFS()
+	if err != nil {
+		return err
+	}
+
+	return fs.Lock(path, lockType, processID)
+}
+
+// Unlock removes a lock using the first filesystem that supports locking
+func (c *ChainFS) Unlock(path string, processID int) error {
+	c.mutex.RLock()
+	defer c.mutex.RUnlock()
+
+	fs, err := c.findFirstLockableFS()
+	if err != nil {
+		return err
+	}
+
+	return fs.Unlock(path, processID)
+}
+
+// IsLocked checks if a file is locked using the first filesystem that supports locking
+func (c *ChainFS) IsLocked(path string) (bool, LockType, error) {
+	c.mutex.RLock()
+	defer c.mutex.RUnlock()
+
+	fs, err := c.findFirstLockableFS()
+	if err != nil {
+		return false, 0, err
+	}
+
+	return fs.IsLocked(path)
+}
+
 // Info implements the chain of responsibility for getting file info
 func (c *ChainFS) Info(path string) (FileInfo, error) {
 	c.mutex.RLock()
@@ -56,6 +105,13 @@ func (c *ChainFS) Read(path string) ([]byte, error) {
 	c.mutex.RLock()
 	defer c.mutex.RUnlock()
 
+	// Check if file is locked
+	if locked, lockType, err := c.IsLocked(path); err == nil && locked {
+		if lockType == WriteLock || lockType == ExclusiveLock {
+			return nil, fmt.Errorf("file is locked for writing")
+		}
+	}
+
 	var lastErr error
 	var content []byte
 
@@ -88,6 +144,11 @@ func (c *ChainFS) Write(path string, content []byte, mode os.FileMode) error {
 	c.mutex.Lock()
 	defer c.mutex.Unlock()
 
+	// Check if file is locked
+	if locked, _, err := c.IsLocked(path); err == nil && locked {
+		return fmt.Errorf("file is locked")
+	}
+
 	// Write to all filesystems that support updates
 	var lastErr error
 	for _, fs := range c.filesystems {
@@ -104,6 +165,11 @@ func (c *ChainFS) Write(path string, content []byte, mode os.FileMode) error {
 func (c *ChainFS) Delete(path string) error {
 	c.mutex.Lock()
 	defer c.mutex.Unlock()
+
+	// Check if file is locked
+	if locked, _, err := c.IsLocked(path); err == nil && locked {
+		return fmt.Errorf("file is locked")
+	}
 
 	var lastErr error
 	for _, fs := range c.filesystems {

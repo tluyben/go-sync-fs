@@ -9,6 +9,7 @@ filesystems:
     max_size: 1073741824  # 1GB in bytes
     can_update: true
     can_delete: true
+    can_lock: true  # Cache must support locking as it's first in chain
 
   # Second filesystem is the main storage
   - type: local
@@ -16,6 +17,7 @@ filesystems:
     path: /home/user/data
     can_update: true
     can_delete: true
+    can_lock: false  # Optional for non-first filesystems
 
   # Example of how to add an S3 backend (not implemented yet)
   # - type: s3
@@ -23,6 +25,7 @@ filesystems:
   #   path: my-bucket/path
   #   can_update: true
   #   can_delete: true
+  #   can_lock: false  # S3 doesn't need locking as it's not first
   #   aws_region: us-east-1
   #   aws_access_key: your-access-key
   #   aws_secret_key: your-secret-key

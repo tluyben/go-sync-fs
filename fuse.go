@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -125,4 +126,104 @@ func (f *File) ReadAll(ctx context.Context) ([]byte, error) {
 	}
 
 	return fileData.Content, nil
+}
+
+// Implement file locking through FUSE
+
+func (f *File) Open(ctx context.Context, req *fuse.OpenRequest, resp *fuse.OpenResponse) (fs.Handle, error) {
+	// Check the flags to determine the type of access
+	flags := req.Flags
+
+	var lockType LockType
+	if flags.IsReadOnly() {
+		lockType = ReadLock
+	} else if flags.IsWriteOnly() {
+		lockType = WriteLock
+	} else if flags.IsReadWrite() {
+		lockType = ExclusiveLock
+	}
+
+	// Try to acquire the lock
+	httpResp, err := f.fs.client.Post(fmt.Sprintf("%s/lock?path=%s&type=%d&pid=%d",
+		f.fs.baseURL,
+		f.path,
+		lockType,
+		os.Getpid()),
+		"application/json",
+		nil)
+	if err != nil {
+		return nil, err
+	}
+	defer httpResp.Body.Close()
+
+	if httpResp.StatusCode != http.StatusOK {
+		return nil, syscall.EACCES
+	}
+
+	handle := &FileHandle{file: f, lockType: lockType}
+	return handle, nil
+}
+
+type FileHandle struct {
+	file     *File
+	lockType LockType
+}
+
+func (h *FileHandle) Release(ctx context.Context, req *fuse.ReleaseRequest) error {
+	// Release the lock
+	httpResp, err := h.file.fs.client.Post(fmt.Sprintf("%s/unlock?path=%s&pid=%d",
+		h.file.fs.baseURL,
+		h.file.path,
+		os.Getpid()),
+		"application/json",
+		nil)
+	if err != nil {
+		return err
+	}
+	defer httpResp.Body.Close()
+
+	if httpResp.StatusCode != http.StatusOK {
+		return syscall.EACCES
+	}
+
+	return nil
+}
+
+func (h *FileHandle) Read(ctx context.Context, req *fuse.ReadRequest, resp *fuse.ReadResponse) error {
+	content, err := h.file.ReadAll(ctx)
+	if err != nil {
+		return err
+	}
+
+	if req.Offset > int64(len(content)) {
+		return nil
+	}
+
+	end := req.Offset + int64(req.Size)
+	if end > int64(len(content)) {
+		end = int64(len(content))
+	}
+
+	resp.Data = content[req.Offset:end]
+	return nil
+}
+
+func (h *FileHandle) Write(ctx context.Context, req *fuse.WriteRequest, resp *fuse.WriteResponse) error {
+	// Send write request to server
+	httpResp, err := h.file.fs.client.Post(fmt.Sprintf("%s/write?path=%s",
+		h.file.fs.baseURL,
+		h.file.path),
+		"application/octet-stream",
+		bytes.NewReader(req.Data))
+	if err != nil {
+		return err
+	}
+	defer httpResp.Body.Close()
+
+	if httpResp.StatusCode != http.StatusOK {
+		return syscall.EIO
+	}
+
+	resp.Size = len(req.Data)
+	return nil
 }
