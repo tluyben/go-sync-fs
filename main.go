@@ -109,59 +109,146 @@ func startFileServer(fs ServerFS, serverAddr string) error {
 	return http.ListenAndServe(serverAddr, nil)
 }
 
-func checkDirectoryRequirements(mountpoint string, masterDir string, cacheDir string) error {
-	// Check if directories exist and create them if necessary
+// checkWritePermission performs a thorough write permission test
+func checkWritePermission(path string) error {
+	// First check if we can create a directory
+	testDir := filepath.Join(path, ".write_test_dir")
+	if err := os.Mkdir(testDir, 0755); err != nil {
+		return fmt.Errorf("cannot create directory: %v", err)
+	}
+	defer os.RemoveAll(testDir)
+
+	// Then check if we can create a file
+	testFile := filepath.Join(path, ".write_test")
+	f, err := os.OpenFile(testFile, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0644)
+	if err != nil {
+		return fmt.Errorf("cannot create file: %v", err)
+	}
+
+	// Try to write some data
+	if _, err := f.WriteString("test"); err != nil {
+		f.Close()
+		os.Remove(testFile)
+		return fmt.Errorf("cannot write to file: %v", err)
+	}
+
+	// Clean up
+	f.Close()
+	if err := os.Remove(testFile); err != nil {
+		return fmt.Errorf("cannot remove test file: %v", err)
+	}
+
+	return nil
+}
+
+// checkMountedDirectoryPermissions verifies the mount point is writable after mounting
+func checkMountedDirectoryPermissions(mountpoint string) error {
+	log.Printf("Testing mounted directory permissions at %s...", mountpoint)
+
+	// Wait a moment for the mount to stabilize
+	time.Sleep(5 * time.Second)
+
+	// Get the current state of the mount point
+	info, err := os.Stat(mountpoint)
+	if err != nil {
+		return fmt.Errorf("failed to stat mounted directory: %v", err)
+	}
+
+	// Check ownership and permissions
+	stat := info.Sys().(*syscall.Stat_t)
+	currentUID := os.Getuid()
+
+	log.Printf("Mounted directory owner: uid=%d (current uid=%d)", stat.Uid, currentUID)
+
+	cleanup(mountpoint)
+	os.Exit(1)
+
+	// Perform write test
+	if err := checkWritePermission(mountpoint); err != nil {
+		return fmt.Errorf("mounted directory is not writable: %v\n\n"+
+			"The mount point is not writable by the current user. To fix this, unmount first then either:\n\n"+
+			"1. Change ownership to current user (recommended):\n"+
+			"   sudo chown %d:%d %s\n\n"+
+			"2. OR allow all users to write (less secure):\n"+
+			"   sudo chmod 777 %s\n\n"+
+			"Then try mounting again.",
+			err, currentUID, os.Getgid(), mountpoint, mountpoint)
+	}
+
+	return nil
+}
+
+// checkDirectoryPermissions checks if all required directories exist and are writable
+func checkDirectoryPermissions(masterDir string, cacheDir string) error {
+	log.Println("Checking directory permissions...")
+
+	// Collect all directories that need checking
 	dirs := map[string]string{
-		"mount":  mountpoint,
 		"master": masterDir,
 		"cache":  cacheDir,
 	}
+
+	var errors []string
+	currentUID := os.Getuid()
 
 	for name, dir := range dirs {
 		if dir == "" {
 			continue
 		}
 
+		log.Printf("Checking %s directory: %s", name, dir)
+
 		// Get absolute path
 		absPath, err := filepath.Abs(dir)
 		if err != nil {
-			return fmt.Errorf("failed to get absolute path for %s directory: %v", name, err)
+			errors = append(errors, fmt.Sprintf("Failed to get absolute path for %s directory: %v", name, err))
+			continue
 		}
 
 		// Check if directory exists
 		info, err := os.Stat(absPath)
 		if os.IsNotExist(err) {
-			// Create directory with proper permissions
-			if err := os.MkdirAll(absPath, 0755); err != nil {
-				return fmt.Errorf("failed to create %s directory: %v\nPlease run: mkdir -p %s && chmod 755 %s",
-					name, err, absPath, absPath)
-			}
+			errors = append(errors, fmt.Sprintf("%s directory does not exist: %s\nRun: mkdir -p %s", name, absPath, absPath))
+			continue
 		} else if err != nil {
-			return fmt.Errorf("failed to check %s directory: %v", name, err)
-		} else {
-			// Directory exists, check permissions
-			mode := info.Mode()
-			if mode.Perm()&0755 != 0755 {
-				return fmt.Errorf("%s directory has incorrect permissions %v\nPlease run: chmod 755 %s",
-					name, mode.Perm(), absPath)
+			errors = append(errors, fmt.Sprintf("Failed to check %s directory: %v", name, err))
+			continue
+		}
+
+		// Check ownership
+		if stat, ok := info.Sys().(*syscall.Stat_t); ok {
+			log.Printf("%s directory owner: uid=%d (current uid=%d)", name, stat.Uid, currentUID)
+			if int(stat.Uid) == 0 { // root owned
+				errors = append(errors, fmt.Sprintf("%s directory is owned by root: %s\nRun: sudo chown %d:%d %s",
+					name, absPath, currentUID, os.Getgid(), absPath))
+				continue
 			}
 		}
 
-		// Check if directory is writable
-		testFile := filepath.Join(absPath, ".write_test")
-		f, err := os.Create(testFile)
-		if err != nil {
-			return fmt.Errorf("%s directory is not writable: %v\nPlease run: chmod u+w %s",
-				name, err, absPath)
+		// Check write permission with thorough test
+		log.Printf("Testing write permissions for %s directory...", name)
+		if err := checkWritePermission(absPath); err != nil {
+			log.Printf("Write permission test failed for %s: %v", name, err)
+			errors = append(errors, fmt.Sprintf("%s directory is not writable: %s\nError: %v\n\nTo fix, run either:\n"+
+				"1. sudo chown %d:%d %s\n"+
+				"2. sudo chmod 777 %s",
+				name, absPath, err, currentUID, os.Getgid(), absPath, absPath))
+			continue
 		}
-		f.Close()
-		os.Remove(testFile)
+		log.Printf("Write permission test passed for %s directory", name)
 	}
 
+	if len(errors) > 0 {
+		return fmt.Errorf("Permission checks failed. Please fix the following issues:\n\n%s", strings.Join(errors, "\n\n"))
+	}
+
+	log.Println("All directory permission checks passed successfully")
 	return nil
 }
 
 func checkFuseRequirements() error {
+	log.Println("Checking FUSE requirements...")
+
 	// Check for fusermount3
 	if _, err := exec.LookPath("fusermount3"); err != nil {
 		return fmt.Errorf("FUSE3 tools not found. Please install them using:\n" +
@@ -194,6 +281,7 @@ func checkFuseRequirements() error {
 			"echo 'user_allow_other' | sudo tee -a /etc/fuse.conf")
 	}
 
+	log.Println("FUSE requirements check passed")
 	return nil
 }
 
@@ -206,17 +294,21 @@ func cleanup(mountpoint string) {
 }
 
 func startFUSE(mountpoint string, serverURL string, done chan struct{}) error {
-	if err := checkFuseRequirements(); err != nil {
-		return err
-	}
-
 	c, err := fuse.Mount(
 		mountpoint,
 		fuse.FSName("remotefs"),
 		fuse.Subtype("remotefs"),
 		fuse.AllowOther(),
+		fuse.DefaultPermissions(),
 	)
 	if err != nil {
+		return fmt.Errorf("mount failed: %v", err)
+	}
+
+	// Check mounted directory permissions
+	if err := checkMountedDirectoryPermissions(mountpoint); err != nil {
+		c.Close()
+		cleanup(mountpoint)
 		return err
 	}
 
@@ -273,8 +365,17 @@ func main() {
 			}
 		}
 
-		if err := checkDirectoryRequirements(config.Mount, masterDir, cacheDir); err != nil {
-			log.Fatalf("Directory requirements check failed: %v", err)
+		mountpoint = config.Mount
+		serverAddr = config.ServerAddr
+
+		// Check directory permissions (except mount point) before proceeding
+		if err := checkDirectoryPermissions(masterDir, cacheDir); err != nil {
+			log.Fatalf("Permission check failed:\n\n%v", err)
+		}
+
+		// Check FUSE requirements before proceeding
+		if err := checkFuseRequirements(); err != nil {
+			log.Fatalf("FUSE check failed:\n\n%v", err)
 		}
 
 		filesystems, err := createFileSystems(config)
@@ -283,8 +384,6 @@ func main() {
 		}
 
 		fs = NewChainFS(filesystems)
-		serverAddr = config.ServerAddr
-		mountpoint = config.Mount
 	} else {
 		// Legacy command line arguments
 		if masterDir == "" {
@@ -304,8 +403,14 @@ func main() {
 			cacheDir = masterDir
 		}
 
-		if err := checkDirectoryRequirements(mountpoint, masterDir, cacheDir); err != nil {
-			log.Fatalf("Directory requirements check failed: %v", err)
+		// Check directory permissions (except mount point) before proceeding
+		if err := checkDirectoryPermissions(masterDir, cacheDir); err != nil {
+			log.Fatalf("Permission check failed:\n\n%v", err)
+		}
+
+		// Check FUSE requirements before proceeding
+		if err := checkFuseRequirements(); err != nil {
+			log.Fatalf("FUSE check failed:\n\n%v", err)
 		}
 
 		fs, err = NewLocalFS(FileSystemConfig{
