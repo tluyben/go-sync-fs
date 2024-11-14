@@ -7,6 +7,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"os/exec"
 	"time"
 
 	"bazil.org/fuse"
@@ -103,7 +104,21 @@ func startFileServer(fs ServerFS, serverAddr string) error {
 	return http.ListenAndServe(serverAddr, nil)
 }
 
+func checkFuseRequirements() error {
+	if _, err := exec.LookPath("fusermount3"); err != nil {
+		return fmt.Errorf("FUSE3 tools not found. Please install them using:\n" +
+			"For Debian/Ubuntu: sudo apt install -y fuse3\n" +
+			"For Fedora: sudo dnf install -y fuse3\n" +
+			"For Arch Linux: sudo pacman -S fuse3\n")
+	}
+	return nil
+}
+
 func startFUSE(mountpoint string, serverURL string) error {
+	if err := checkFuseRequirements(); err != nil {
+		return err
+	}
+
 	c, err := fuse.Mount(
 		mountpoint,
 		fuse.FSName("remotefs"),
