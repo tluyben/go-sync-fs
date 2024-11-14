@@ -146,7 +146,7 @@ func checkMountedDirectoryPermissions(mountpoint string) error {
 	log.Printf("Testing mounted directory permissions at %s...", mountpoint)
 
 	// Wait a moment for the mount to stabilize
-	time.Sleep(5 * time.Second)
+	time.Sleep(2 * time.Second)
 
 	// Get the current state of the mount point
 	info, err := os.Stat(mountpoint)
@@ -159,9 +159,6 @@ func checkMountedDirectoryPermissions(mountpoint string) error {
 	currentUID := os.Getuid()
 
 	log.Printf("Mounted directory owner: uid=%d (current uid=%d)", stat.Uid, currentUID)
-
-	cleanup(mountpoint)
-	os.Exit(1)
 
 	// Perform write test
 	if err := checkWritePermission(mountpoint); err != nil {
@@ -239,7 +236,7 @@ func checkDirectoryPermissions(masterDir string, cacheDir string) error {
 	}
 
 	if len(errors) > 0 {
-		return fmt.Errorf("Permission checks failed. Please fix the following issues:\n\n%s", strings.Join(errors, "\n\n"))
+		return fmt.Errorf("permission checks failed. Please fix the following issues:\n\n%s", strings.Join(errors, "\n\n"))
 	}
 
 	log.Println("All directory permission checks passed successfully")
@@ -251,7 +248,7 @@ func checkFuseRequirements() error {
 
 	// Check for fusermount3
 	if _, err := exec.LookPath("fusermount3"); err != nil {
-		return fmt.Errorf("FUSE3 tools not found. Please install them using:\n" +
+		return fmt.Errorf("FUSE3 tools not found - please install them using:\n" +
 			"For Debian/Ubuntu: sudo apt install -y fuse3\n" +
 			"For Fedora: sudo dnf install -y fuse3\n" +
 			"For Arch Linux: sudo pacman -S fuse3\n")
@@ -294,12 +291,19 @@ func cleanup(mountpoint string) {
 }
 
 func startFUSE(mountpoint string, serverURL string, done chan struct{}) error {
+	// Ensure proper permissions on mount point
+	if err := os.Chmod(mountpoint, 0755); err != nil {
+		return fmt.Errorf("failed to set mount point permissions: %v", err)
+	}
+
 	c, err := fuse.Mount(
 		mountpoint,
 		fuse.FSName("remotefs"),
 		fuse.Subtype("remotefs"),
 		fuse.AllowOther(),
 		fuse.DefaultPermissions(),
+		fuse.WritebackCache(),
+		fuse.MaxReadahead(128*1024),
 	)
 	if err != nil {
 		return fmt.Errorf("mount failed: %v", err)
@@ -319,7 +323,7 @@ func startFUSE(mountpoint string, serverURL string, done chan struct{}) error {
 
 	filesys := &FS{
 		client: &http.Client{
-			Timeout: 10 * time.Second,
+			Timeout: 30 * time.Second, // Increased timeout
 		},
 		baseURL: serverURL,
 	}
@@ -419,7 +423,7 @@ func main() {
 			Features: FileSystemFeatures{
 				CanUpdate: true,
 				CanDelete: true,
-				CanLock:   false,
+				CanLock:   true, // Enable locking
 			},
 			RootPath: masterDir,
 		})

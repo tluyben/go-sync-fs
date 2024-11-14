@@ -145,8 +145,15 @@ func (c *ChainFS) Write(path string, content []byte, mode os.FileMode) error {
 	defer c.mutex.Unlock()
 
 	// Check if file is locked
-	if locked, _, err := c.IsLocked(path); err == nil && locked {
-		return fmt.Errorf("file is locked")
+	if locked, lockType, err := c.IsLocked(path); err == nil && locked {
+		// Allow write if the process has a write or exclusive lock
+		if os.Getpid() == c.getProcessIDForLock(path) && (lockType == WriteLock || lockType == ExclusiveLock) {
+			// Process has appropriate lock, allow write
+		} else if lockType == ReadLock {
+			return fmt.Errorf("file is locked for reading")
+		} else {
+			return fmt.Errorf("file is locked by another process")
+		}
 	}
 
 	// Write to all filesystems that support updates
@@ -159,6 +166,25 @@ func (c *ChainFS) Write(path string, content []byte, mode os.FileMode) error {
 		}
 	}
 	return lastErr
+}
+
+// getProcessIDForLock helper function to get the process ID of the lock owner
+func (c *ChainFS) getProcessIDForLock(path string) int {
+	fs, err := c.findFirstLockableFS()
+	if err != nil {
+		return -1
+	}
+
+	// Since we can't directly get the process ID from the interface,
+	// we'll need to check if the filesystem implements a way to get it
+	if localFS, ok := fs.(*LocalFS); ok {
+		localFS.lockMutex.RLock()
+		defer localFS.lockMutex.RUnlock()
+		if lock, exists := localFS.locks[path]; exists {
+			return lock.ProcessID
+		}
+	}
+	return -1
 }
 
 // Delete implements the chain of responsibility for deleting files

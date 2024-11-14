@@ -2,6 +2,7 @@ package main
 
 import (
 	"errors"
+	"fmt"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -255,17 +256,23 @@ func (l *LocalFS) Write(path string, content []byte, mode os.FileMode) error {
 
 	// Check write lock
 	if l.config.Features.CanLock {
-		locked, lockType, _ := l.IsLocked(path)
-		if locked && (lockType == ReadLock || lockType == WriteLock || lockType == ExclusiveLock) {
-			return errors.New("file is locked")
+		if lock, exists := l.locks[path]; exists {
+			// Allow write if the process has a write or exclusive lock
+			if lock.ProcessID == os.Getpid() && (lock.LockType == WriteLock || lock.LockType == ExclusiveLock) {
+				// Process has appropriate lock, allow write
+			} else if lock.LockType == ReadLock {
+				return errors.New("file is locked for reading")
+			} else {
+				return errors.New("file is locked by another process")
+			}
 		}
 	}
 
 	fullPath := filepath.Join(l.root, path)
 
-	// Ensure parent directory exists
-	if err := os.MkdirAll(filepath.Dir(fullPath), 0755); err != nil {
-		return err
+	// Ensure parent directory exists with proper permissions
+	if err := os.MkdirAll(filepath.Dir(fullPath), 0775); err != nil {
+		return fmt.Errorf("failed to create directory: %v", err)
 	}
 
 	if l.config.Role == RoleCache {
@@ -275,8 +282,21 @@ func (l *LocalFS) Write(path string, content []byte, mode os.FileMode) error {
 		}
 	}
 
-	if err := os.WriteFile(fullPath, content, mode); err != nil {
-		return err
+	// Create or truncate the file with proper permissions
+	f, err := os.OpenFile(fullPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, mode)
+	if err != nil {
+		return fmt.Errorf("failed to open file for writing: %v", err)
+	}
+	defer f.Close()
+
+	// Write the content
+	if _, err := f.Write(content); err != nil {
+		return fmt.Errorf("failed to write content: %v", err)
+	}
+
+	// Ensure the file has the correct permissions
+	if err := f.Chmod(mode); err != nil {
+		return fmt.Errorf("failed to set file permissions: %v", err)
 	}
 
 	if l.config.Role == RoleCache {
