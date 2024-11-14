@@ -1,11 +1,11 @@
-mount: /mnt/synced
+mount: ./mntdir
 server_addr: :8080
 
 filesystems:
   # First filesystem acts as a cache
   - type: local
     role: cache
-    path: /tmp/fs-cache
+    path: ./cache
     max_size: 1073741824  # 1GB in bytes
     can_update: true
     can_delete: true
@@ -14,7 +14,7 @@ filesystems:
   # Second filesystem is the main storage
   - type: local
     role: main
-    path: /home/user/data
+    path: ./testdir
     can_update: true
     can_delete: true
     can_lock: false  # Optional for non-first filesystems

@@ -13,3 +13,6 @@ env.local
 /Godeps/
 editor
 go-sync-fs
+cache
+testdir
+mntdir
